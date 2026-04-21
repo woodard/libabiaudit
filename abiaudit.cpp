@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <link.h> // For Lmid_t and LM_ID_NEWLM
 
 // libabigail headers
 #include <abg-corpus.h>
@@ -51,7 +52,7 @@ int main(int argc, char** argv) {
     std::string sock_path = "/tmp/abiaudit." + std::to_string(getpid()) + ".sock";
     strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
 
-    unlink(sock_path.c_str()); // Ensure clean state
+    unlink(sock_path.c_str()); 
     if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind");
         return 1;
@@ -62,10 +63,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 2. Set the socket environment variable (inherited by the child)
     setenv("ABIAUDIT_SOCKET", sock_path.c_str(), 1);
 
-    // 3. Fork and launch target program
+    // 2. Fork and launch target program
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
@@ -73,18 +73,14 @@ int main(int argc, char** argv) {
     }
 
     if (pid == 0) {
-        // Child Process: Launch the target application
-        
-        // Set LD_AUDIT exclusively for the child process so the parent remains clean.
-        // Assumes libabiaudit.so is built in the current directory, or in the library path.
+        // Isolate LD_AUDIT strictly to the child process
         setenv("LD_AUDIT", "./libabiaudit.so", 1); 
-        
         execvp(argv[1], &argv[1]);
         perror("execvp");
         exit(1);
     }
 
-    // 4. Parent Process: Server Loop
+    // 3. Parent Process: Server Loop
     int client_fd = accept(server_fd, nullptr, nullptr);
     if (client_fd < 0) {
         perror("accept");
@@ -93,11 +89,13 @@ int main(int argc, char** argv) {
     }
 
     FILE* stream = fdopen(client_fd, "r+");
-    setvbuf(stream, nullptr, _IOLBF, 0); // Line buffering
+    setvbuf(stream, nullptr, _IOLBF, 0);
 
     abigail::ir::environment env;
     std::unordered_map<std::string, abigail::corpus_sptr> corpora;
-    std::vector<std::string> loaded_list;
+    
+    // Namespace separation map: Lmid_t -> List of Loaded Libraries
+    std::unordered_map<Lmid_t, std::vector<std::string>> loaded_lists;
 
     char line[4096];
     while (fgets(line, sizeof(line), stream)) {
@@ -123,36 +121,62 @@ int main(int argc, char** argv) {
                 }
             }
         } 
-        else if (cmd == "COMPARE") {
+        else if (cmd == "CHECK") {
             size_t sep = args.find(' ');
-            std::string p1 = args.substr(0, sep);
-            std::string p2 = args.substr(sep + 1);
+            Lmid_t lmid = std::stoll(args.substr(0, sep));
+            std::string path = args.substr(sep + 1);
             
-            if (corpora.count(p1) && corpora.count(p2)) {
-                if (is_abi_compatible(corpora[p1], corpora[p2])) {
-                    fprintf(stream, "COMPATIBLE\n");
-                } else {
-                    fprintf(stream, "INCOMPATIBLE\n");
-                }
+            if (lmid == LM_ID_NEWLM) {
+                // If it's destined for a new namespace, there are no existing
+                // objects in that namespace to be incompatible with.
+                fprintf(stream, "COMPATIBLE\n");
             } else {
-                fprintf(stream, "ERROR\n");
+                bool compatible = true;
+                if (corpora.count(path)) {
+                    auto candidate = corpora[path];
+                    
+                    // Iterate and compare ONLY against libraries in the target namespace
+                    for (const auto& loaded_path : loaded_lists[lmid]) {
+                        if (loaded_path == path) continue;
+                        auto loaded = corpora[loaded_path];
+                        
+                        // Bi-directional check
+                        if (!is_abi_compatible(loaded, candidate) || 
+                            !is_abi_compatible(candidate, loaded)) {
+                            compatible = false;
+                            break;
+                        }
+                    }
+                } else {
+                    compatible = false;
+                }
+                fprintf(stream, compatible ? "COMPATIBLE\n" : "INCOMPATIBLE\n");
             }
         } 
         else if (cmd == "COMMIT") {
-            // Promotes a loaded corpus to the official "loaded list" for comparison
-            if (std::find(loaded_list.begin(), loaded_list.end(), args) == loaded_list.end()) {
-                loaded_list.push_back(args);
+            size_t sep = args.find(' ');
+            Lmid_t lmid = std::stoll(args.substr(0, sep));
+            std::string path = args.substr(sep + 1);
+            
+            auto& list = loaded_lists[lmid];
+            if (std::find(list.begin(), list.end(), path) == list.end()) {
+                list.push_back(path);
             }
             fprintf(stream, "OK\n");
         } 
         else if (cmd == "DELETE") {
             corpora.erase(args);
-            loaded_list.erase(std::remove(loaded_list.begin(), loaded_list.end(), args), loaded_list.end());
+            // Erase from all namespaces if present
+            for (auto& pair : loaded_lists) {
+                auto& list = pair.second;
+                list.erase(std::remove(list.begin(), list.end(), args), list.end());
+            }
             fprintf(stream, "OK\n");
         } 
         else if (cmd == "LIST") {
+            Lmid_t lmid = std::stoll(args);
             fprintf(stream, "LIST_START\n");
-            for (const auto& l : loaded_list) {
+            for (const auto& l : loaded_lists[lmid]) {
                 fprintf(stream, "%s\n", l.c_str());
             }
             fprintf(stream, "LIST_END\n");
@@ -163,7 +187,6 @@ int main(int argc, char** argv) {
         fflush(stream);
     }
 
-    // Cleanup
     fclose(stream);
     close(server_fd);
     unlink(sock_path.c_str());

@@ -4,14 +4,20 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <unordered_map>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <cstdlib>
+#include <cstring>
 
-// Global IPC state
+// Global IPC and Namespace state
 static std::mutex g_ipc_mutex;
+static std::mutex g_namespace_mutex;
 static int g_sock = -1;
 static bool g_init_complete = false;
+
+// Maps an object's cookie (struct link_map*) to the namespace it was loaded into
+static std::unordered_map<uintptr_t*, Lmid_t> g_namespace_map;
 
 // Basic function to read a single newline-delimited string
 static std::string read_line() {
@@ -39,24 +45,34 @@ static std::string send_cmd(const std::string& cmd) {
     return send_cmd_locked(cmd);
 }
 
-// Function to fetch the dynamic list of loaded libraries
-static std::vector<std::string> get_loaded_list() {
-    std::lock_guard<std::mutex> lock(g_ipc_mutex);
-    std::vector<std::string> list;
-    if (g_sock < 0) return list;
+// Helper to determine if a library search was triggered by an AUDIT tag
+static bool is_loaded_as_audit(uintptr_t* cookie, const char* search_name) {
+    if (!cookie || !search_name) return false;
 
-    std::string to_send = "LIST\n";
-    if (write(g_sock, to_send.c_str(), to_send.size()) < 0) return list;
+    // In glibc, the cookie is the initiating object's link_map pointer
+    struct link_map* initiating_map = reinterpret_cast<struct link_map*>(cookie);
+    if (!initiating_map->l_ld) return false;
 
-    std::string start = read_line();
-    if (start != "LIST_START") return list;
-
-    while (true) {
-        std::string line = read_line();
-        if (line == "LIST_END" || line.empty()) break;
-        list.push_back(line);
+    // 1. Locate the dynamic string table (DT_STRTAB)
+    const char* strtab = nullptr;
+    for (ElfW(Dyn)* dyn = initiating_map->l_ld; dyn->d_tag != DT_NULL; ++dyn) {
+        if (dyn->d_tag == DT_STRTAB) {
+            strtab = reinterpret_cast<const char*>(initiating_map->l_addr + dyn->d_un.d_ptr);
+            break;
+        }
     }
-    return list;
+    if (!strtab) return false;
+
+    // 2. Scan for DT_AUDIT or DT_DEPAUDIT tags
+    for (ElfW(Dyn)* dyn = initiating_map->l_ld; dyn->d_tag != DT_NULL; ++dyn) {
+        if (dyn->d_tag == DT_AUDIT || dyn->d_tag == DT_DEPAUDIT) {
+            const char* audit_target_name = strtab + dyn->d_un.d_val;
+            if (strstr(search_name, audit_target_name) != nullptr) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 extern "C" {
@@ -64,7 +80,6 @@ extern "C" {
 unsigned int la_version(unsigned int version) {
     if (version == 0) return 0;
 
-    // Connect to the server defined by the launcher
     const char* sock_path = getenv("ABIAUDIT_SOCKET");
     if (sock_path) {
         g_sock = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -83,7 +98,7 @@ unsigned int la_version(unsigned int version) {
     return LAV_CURRENT;
 }
 
-char* la_objsearch(const char* name, [[maybe_unused]] uintptr_t* cookie, [[maybe_unused]] unsigned int flag) {
+char* la_objsearch(const char* name, uintptr_t* cookie, [[maybe_unused]] unsigned int flag) {
     if (!name || name[0] == '\0' || g_init_complete || g_sock < 0) {
         return const_cast<char*>(name);
     }
@@ -91,47 +106,59 @@ char* la_objsearch(const char* name, [[maybe_unused]] uintptr_t* cookie, [[maybe
         return const_cast<char*>(name);
     }
 
+    Lmid_t target_lmid = LM_ID_BASE; // Default assumption
+
+    // 1. Look up the namespace of the object initiating the search
+    {
+        std::lock_guard<std::mutex> lock(g_namespace_mutex);
+        if (g_namespace_map.count(cookie)) {
+            target_lmid = g_namespace_map[cookie];
+        }
+    }
+
+    // 2. If it is being loaded as an auditor, override the target to LM_ID_NEWLM
+    if (is_loaded_as_audit(cookie, name)) {
+        target_lmid = LM_ID_NEWLM;
+    }
+
     std::string path = name;
     
-    // 1. Ask Server to load the ABI
+    // 3. Ask Server to load the ABI into its cache
     std::string resp = send_cmd("LOAD " + path);
-    if (resp != "OK") return nullptr; // Parse failed
+    if (resp != "OK") return nullptr; 
 
-    // 2. Fetch previously loaded ABIs from Server
-    std::vector<std::string> loaded_libs = get_loaded_list();
+    // 4. Command Server to do the heavy lifting: compare against the target namespace
+    resp = send_cmd("CHECK " + std::to_string(target_lmid) + " " + path);
 
-    // 3. Command Server to compare candidate against every loaded ABI bi-directionally
-    for (const auto& loaded_lib : loaded_libs) {
-        if (loaded_lib == path) continue;
-
-        std::string c1 = send_cmd("COMPARE " + loaded_lib + " " + path);
-        std::string c2 = send_cmd("COMPARE " + path + " " + loaded_lib);
-
-        if (c1 != "COMPATIBLE" || c2 != "COMPATIBLE") {
-            std::cerr << "[LD_AUDIT] ABI Incompatibility between '" << loaded_lib 
-                      << "' and '" << path << "'\n";
-            
-            // Delete the incompatible candidate corpus to free memory
-            send_cmd("DELETE " + path);
-            return nullptr;
-        }
+    if (resp != "COMPATIBLE") {
+        std::cerr << "[LD_AUDIT] ABI Incompatibility detected for '" << path 
+                  << "' in namespace " << target_lmid << "\n";
+        
+        send_cmd("DELETE " + path);
+        return nullptr;
     }
 
     return const_cast<char*>(name);
 }
 
-unsigned int la_objopen(struct link_map* map, [[maybe_unused]] Lmid_t lmid, [[maybe_unused]] uintptr_t* cookie) {
+unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
     if (g_init_complete || !map || !map->l_name || map->l_name[0] == '\0' || g_sock < 0) {
         return LA_FLG_BINDTO | LA_FLG_BINDFROM;
     }
 
+    // Record the assigned namespace for this object's cookie so future searches
+    // initiated by this object resolve to the correct namespace
+    {
+        std::lock_guard<std::mutex> lock(g_namespace_mutex);
+        g_namespace_map[cookie] = lmid;
+    }
+
     std::string path = map->l_name;
     
-    // Ensure the server has it loaded (e.g., if la_objsearch was bypassed)
+    // Ensure the server has it loaded, then commit it to the specific lmid's list
     std::string resp = send_cmd("LOAD " + path);
     if (resp == "OK") {
-        // Promote it to the official comparison list
-        send_cmd("COMMIT " + path);
+        send_cmd("COMMIT " + std::to_string(lmid) + " " + path);
     }
 
     return LA_FLG_BINDTO | LA_FLG_BINDFROM;
@@ -140,10 +167,6 @@ unsigned int la_objopen(struct link_map* map, [[maybe_unused]] Lmid_t lmid, [[ma
 void la_preinit([[maybe_unused]] uintptr_t* cookie) {
     g_init_complete = true;
     if (g_sock >= 0) {
-        std::vector<std::string> loaded_libs = get_loaded_list();
-        for (const auto& l : loaded_libs) {
-            send_cmd("DELETE " + l);
-        }
         send_cmd("QUIT");
         close(g_sock);
         g_sock = -1;
