@@ -7,6 +7,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <exception>
+#include <cstdlib> // Added for getenv()
 
 // libabigail headers
 #include <abg-corpus.h>
@@ -17,6 +18,7 @@
 // Global state
 static std::mutex g_audit_mutex;
 static bool g_init_complete = false;
+static bool g_debug_mode = false; // Flag for ABIAUDIT=debug
 static abigail::ir::environment g_abg_env;
 
 // Cache of libraries successfully loaded
@@ -54,6 +56,13 @@ extern "C" {
 
 // 1. Handshake to establish LD_AUDIT version
 unsigned int la_version(unsigned int version) {
+    // Check for the ABIAUDIT environment variable
+    if (const char* env = getenv("ABIAUDIT")) {
+        if (std::string(env) == "debug") {
+            g_debug_mode = true;
+        }
+    }
+
     if (version == 0) return 0;
     return LAV_CURRENT;
 }
@@ -83,6 +92,10 @@ char* la_objsearch(const char* name, [[maybe_unused]] uintptr_t* cookie, [[maybe
         if (it != g_corpus_cache.end()) {
             candidate_corpus = it->second;
         } else {
+            if (g_debug_mode) {
+                std::cerr << "[ABIAUDIT] loading corpus for " << lib_path << "\n";
+            }
+
             // Read DWARF into corpus using the correct API
             std::vector<std::string> di_roots;
             abigail::fe_iface::status status = abigail::fe_iface::STATUS_UNKNOWN;
@@ -102,6 +115,10 @@ char* la_objsearch(const char* name, [[maybe_unused]] uintptr_t* cookie, [[maybe
                 if (!loaded_corpus) continue;
 
                 // Direction 1: Loaded Object -> Candidate
+                if (g_debug_mode) {
+                    std::cerr << "[ABIAUDIT] comparing abi of " << loaded_corpus->get_path() 
+                              << " to " << lib_path << "\n";
+                }
                 if (!is_abi_compatible(loaded_corpus, candidate_corpus)) {
                     std::cerr << "[LD_AUDIT] ABI Incompatibility: Loaded '" 
                               << loaded_corpus->get_path() << "' expects interfaces missing/changed in candidate '" 
@@ -110,6 +127,10 @@ char* la_objsearch(const char* name, [[maybe_unused]] uintptr_t* cookie, [[maybe
                 }
 
                 // Direction 2: Candidate -> Loaded Object
+                if (g_debug_mode) {
+                    std::cerr << "[ABIAUDIT] comparing abi of " << lib_path 
+                              << " to " << loaded_corpus->get_path() << "\n";
+                }
                 if (!is_abi_compatible(candidate_corpus, loaded_corpus)) {
                     std::cerr << "[LD_AUDIT] ABI Incompatibility: Candidate '" 
                               << lib_path << "' expects interfaces missing/changed in loaded object '" 
@@ -146,6 +167,10 @@ unsigned int la_objopen(struct link_map* map, [[maybe_unused]] Lmid_t lmid, [[ma
         if (it != g_corpus_cache.end()) {
             g_loaded_corpora.push_back(it->second);
         } else if (access(lib_path.c_str(), R_OK) == 0) {
+            if (g_debug_mode) {
+                std::cerr << "[ABIAUDIT] loading corpus for " << lib_path << "\n";
+            }
+
             // Main executable or vDSO edge cases that bypass la_objsearch
             std::vector<std::string> di_roots;
             abigail::fe_iface::status status = abigail::fe_iface::STATUS_UNKNOWN;
