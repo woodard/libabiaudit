@@ -31,9 +31,15 @@ static bool is_abi_compatible(const abigail::corpus_sptr& obj1,
                               const abigail::corpus_sptr& obj2) {
     if (!obj1 || !obj2) return true; // Cannot compare, fallback to allow
 
-    abigail::comparison::diff_context_sptr diff_ctxt = 
-        abigail::comparison::diff_context::create();
+    // Correctly instantiate the diff_context using new, as done in abicompat.cc
+    abigail::comparison::diff_context_sptr diff_ctxt(new abigail::comparison::diff_context());
     
+    // Ignore harmless changes (e.g., compatible types, benign name changes) 
+    // to avoid false positive rejections at runtime.
+    diff_ctxt->switch_categories_off(
+        abigail::comparison::get_default_harmless_categories_bitmap()
+    );
+
     abigail::comparison::corpus_diff_sptr diff = 
         abigail::comparison::compute_diff(obj1, obj2, diff_ctxt);
 
