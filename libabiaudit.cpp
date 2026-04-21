@@ -10,7 +10,8 @@
 
 // libabigail headers
 #include <abg-corpus.h>
-#include <abg-dwarf-reader.h>
+#include <abg-reader.h>        // Added for abigail::fe_iface::status
+#include <abg-dwarf-reader.h>  // Added for abigail::dwarf::read_corpus_from_elf
 #include <abg-comparison.h>
 
 // Global state
@@ -31,7 +32,7 @@ static bool is_abi_compatible(const abigail::corpus_sptr& obj1,
                               const abigail::corpus_sptr& obj2) {
     if (!obj1 || !obj2) return true; // Cannot compare, fallback to allow
 
-    // Correctly instantiate the diff_context using new, as done in abicompat.cc
+    // Correctly instantiate the diff_context
     abigail::comparison::diff_context_sptr diff_ctxt(new abigail::comparison::diff_context());
     
     // Ignore harmless changes (e.g., compatible types, benign name changes) 
@@ -64,7 +65,6 @@ char* la_objsearch(const char* name, uintptr_t* cookie, unsigned int flag) {
     std::lock_guard<std::mutex> lock(g_audit_mutex);
 
     // If init_complete probe is passed, skip the heavy ABI checking for late dlopen()
-    // based on the requirement to free corpora at init_complete.
     if (g_init_complete) {
         return const_cast<char*>(name);
     }
@@ -83,16 +83,16 @@ char* la_objsearch(const char* name, uintptr_t* cookie, unsigned int flag) {
         if (it != g_corpus_cache.end()) {
             candidate_corpus = it->second;
         } else {
-            // Read DWARF into corpus
+            // Read DWARF into corpus using the correct API
             std::vector<char**> di_roots; 
-            abigail::dwarf_reader::read_context_sptr read_ctxt =
-                abigail::dwarf_reader::create_read_context(lib_path, di_roots, &g_abg_env, false);
+            abigail::fe_iface::status status = abigail::fe_iface::STATUS_UNKNOWN;
             
-            if (read_ctxt) {
-                candidate_corpus = abigail::dwarf_reader::read_corpus_from_elf(*read_ctxt, nullptr);
-                if (candidate_corpus) {
-                    g_corpus_cache[lib_path] = candidate_corpus;
-                }
+            candidate_corpus = abigail::dwarf::read_corpus_from_elf(
+                lib_path, di_roots, g_abg_env, false, status
+            );
+            
+            if (candidate_corpus) {
+                g_corpus_cache[lib_path] = candidate_corpus;
             }
         }
 
@@ -148,13 +148,14 @@ unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
         } else if (access(lib_path.c_str(), R_OK) == 0) {
             // Main executable or vDSO edge cases that bypass la_objsearch
             std::vector<char**> di_roots;
-            abigail::dwarf_reader::read_context_sptr read_ctxt =
-                abigail::dwarf_reader::create_read_context(lib_path, di_roots, &g_abg_env, false);
-            if (read_ctxt) {
-                abigail::corpus_sptr corpus = abigail::dwarf_reader::read_corpus_from_elf(*read_ctxt, nullptr);
-                if (corpus) {
-                    g_loaded_corpora.push_back(corpus);
-                }
+            abigail::fe_iface::status status = abigail::fe_iface::STATUS_UNKNOWN;
+            
+            abigail::corpus_sptr corpus = abigail::dwarf::read_corpus_from_elf(
+                lib_path, di_roots, g_abg_env, false, status
+            );
+            
+            if (corpus) {
+                g_loaded_corpora.push_back(corpus);
             }
         }
     } catch (...) {
