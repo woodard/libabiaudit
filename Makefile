@@ -1,30 +1,29 @@
 # Compiler settings
 CXX = g++
-CXXFLAGS = -gsplit-dwarf -std=c++17 -fPIC -Wall -Wextra -O2 -I/usr/include/libabigail
+CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -g -gsplit-dwarf -I/usr/include/libabigail
 
-# Linker settings
-LDFLAGS = -shared
-LDLIBS = -labigail -ldl
+# Server settings
+SERVER_TARGET = abiaudit
+SERVER_LDLIBS = -labigail
 
-# Target and source files
-TARGET = libabiaudit.so
-SRCS = libabiaudit.cpp
-OBJS = $(SRCS:.cpp=.o)
+# Client settings
+CLIENT_TARGET = libabiaudit.so
+CLIENT_LDFLAGS = -shared
+CLIENT_LDLIBS = -ldl
 
 # Default target
-all: $(TARGET)
+all: $(SERVER_TARGET) $(CLIENT_TARGET)
 
-# Rule to link the shared library
-$(TARGET): $(OBJS)
-	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+# Rule to build the Server Application
+$(SERVER_TARGET): abiaudit.cpp
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(SERVER_LDLIBS)
 
-# Rule to compile C++ source files into object files
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+# Rule to build the Client LD_AUDIT Library
+$(CLIENT_TARGET): libabiaudit.cpp
+	$(CXX) $(CXXFLAGS) -fPIC $(CLIENT_LDFLAGS) -o $@ $^ $(CLIENT_LDLIBS)
 
-# Clean up build artifacts
+# Clean up build artifacts and editor backups
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(SERVER_TARGET) $(CLIENT_TARGET) *.o *.dwo *~
 
-# Phony targets to prevent conflicts with files named 'all' or 'clean'
 .PHONY: all clean

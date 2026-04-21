@@ -1,205 +1,153 @@
 #include <link.h>
-#include <dlfcn.h>
 #include <unistd.h>
 #include <iostream>
-#include <vector>
 #include <string>
+#include <vector>
 #include <mutex>
-#include <unordered_map>
-#include <exception>
-#include <cstdlib> // Added for getenv()
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <cstdlib>
 
-// libabigail headers
-#include <abg-corpus.h>
-#include <abg-reader.h>        
-#include <abg-dwarf-reader.h>  
-#include <abg-comparison.h>
-
-// Global state
-static std::mutex g_audit_mutex;
+// Global IPC state
+static std::mutex g_ipc_mutex;
+static int g_sock = -1;
 static bool g_init_complete = false;
-static bool g_debug_mode = false; // Flag for ABIAUDIT=debug
-static abigail::ir::environment g_abg_env;
 
-// Cache of libraries successfully loaded
-static std::vector<abigail::corpus_sptr> g_loaded_corpora;
+// Basic function to read a single newline-delimited string
+static std::string read_line() {
+    std::string resp;
+    char c;
+    while (read(g_sock, &c, 1) == 1) {
+        if (c == '\n') break;
+        resp += c;
+    }
+    return resp;
+}
 
-// Cache of libraries currently being evaluated (to avoid re-reading DWARF 
-// between la_objsearch and la_objopen)
-static std::unordered_map<std::string, abigail::corpus_sptr> g_corpus_cache;
+// Function to send a command and receive a single-line response
+static std::string send_cmd_locked(const std::string& cmd) {
+    if (g_sock < 0) return "ERROR";
+    std::string to_send = cmd + "\n";
+    if (write(g_sock, to_send.c_str(), to_send.size()) < 0) {
+        return "ERROR";
+    }
+    return read_line();
+}
 
-// Helper function to check ABI compatibility
-// Returns true if compatible, false if incompatible changes are detected.
-static bool is_abi_compatible(const abigail::corpus_sptr& obj1, 
-                              const abigail::corpus_sptr& obj2) {
-    if (!obj1 || !obj2) return true; // Cannot compare, fallback to allow
+static std::string send_cmd(const std::string& cmd) {
+    std::lock_guard<std::mutex> lock(g_ipc_mutex);
+    return send_cmd_locked(cmd);
+}
 
-    // Correctly instantiate the diff_context
-    abigail::comparison::diff_context_sptr diff_ctxt(new abigail::comparison::diff_context());
-    
-    // Ignore harmless changes (e.g., compatible types, benign name changes) 
-    // to avoid false positive rejections at runtime.
-    diff_ctxt->switch_categories_off(
-        abigail::comparison::get_default_harmless_categories_bitmap()
-    );
+// Function to fetch the dynamic list of loaded libraries
+static std::vector<std::string> get_loaded_list() {
+    std::lock_guard<std::mutex> lock(g_ipc_mutex);
+    std::vector<std::string> list;
+    if (g_sock < 0) return list;
 
-    abigail::comparison::corpus_diff_sptr diff = 
-        abigail::comparison::compute_diff(obj1, obj2, diff_ctxt);
+    std::string to_send = "LIST\n";
+    if (write(g_sock, to_send.c_str(), to_send.size()) < 0) return list;
 
-    if (!diff) return true; // No differences found
+    std::string start = read_line();
+    if (start != "LIST_START") return list;
 
-    // If there are differences, we only block if they break the ABI
-    return !diff->has_incompatible_changes();
+    while (true) {
+        std::string line = read_line();
+        if (line == "LIST_END" || line.empty()) break;
+        list.push_back(line);
+    }
+    return list;
 }
 
 extern "C" {
 
-// 1. Handshake to establish LD_AUDIT version
 unsigned int la_version(unsigned int version) {
-    // Check for the ABIAUDIT environment variable
-    if (const char* env = getenv("ABIAUDIT")) {
-        if (std::string(env) == "debug") {
-            g_debug_mode = true;
+    if (version == 0) return 0;
+
+    // Connect to the server defined by the launcher
+    const char* sock_path = getenv("ABIAUDIT_SOCKET");
+    if (sock_path) {
+        g_sock = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (g_sock >= 0) {
+            struct sockaddr_un addr;
+            addr.sun_family = AF_UNIX;
+            strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+            
+            if (connect(g_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+                close(g_sock);
+                g_sock = -1;
+                std::cerr << "[LD_AUDIT] Warning: Failed to connect to IPC socket.\n";
+            }
         }
     }
-
-    if (version == 0) return 0;
     return LAV_CURRENT;
 }
 
-// 2. Intercept library searches to perform ABI checks
 char* la_objsearch(const char* name, [[maybe_unused]] uintptr_t* cookie, [[maybe_unused]] unsigned int flag) {
-    if (!name || name[0] == '\0') return const_cast<char*>(name);
-
-    std::lock_guard<std::mutex> lock(g_audit_mutex);
-
-    // If init_complete probe is passed, skip the heavy ABI checking for late dlopen()
-    if (g_init_complete) {
+    if (!name || name[0] == '\0' || g_init_complete || g_sock < 0) {
         return const_cast<char*>(name);
     }
-
-    // Fast filesystem check: Skip if the file doesn't exist or isn't readable
     if (access(name, R_OK) != 0) {
         return const_cast<char*>(name);
     }
 
-    try {
-        abigail::corpus_sptr candidate_corpus;
-        std::string lib_path(name);
+    std::string path = name;
+    
+    // 1. Ask Server to load the ABI
+    std::string resp = send_cmd("LOAD " + path);
+    if (resp != "OK") return nullptr; // Parse failed
 
-        // Check if we already evaluated this candidate
-        auto it = g_corpus_cache.find(lib_path);
-        if (it != g_corpus_cache.end()) {
-            candidate_corpus = it->second;
-        } else {
-            if (g_debug_mode) {
-                std::cerr << "[ABIAUDIT] loading corpus for " << lib_path << "\n";
-            }
+    // 2. Fetch previously loaded ABIs from Server
+    std::vector<std::string> loaded_libs = get_loaded_list();
 
-            // Read DWARF into corpus using the correct API
-            std::vector<std::string> di_roots;
-            abigail::fe_iface::status status = abigail::fe_iface::STATUS_UNKNOWN;
+    // 3. Command Server to compare candidate against every loaded ABI bi-directionally
+    for (const auto& loaded_lib : loaded_libs) {
+        if (loaded_lib == path) continue;
+
+        std::string c1 = send_cmd("COMPARE " + loaded_lib + " " + path);
+        std::string c2 = send_cmd("COMPARE " + path + " " + loaded_lib);
+
+        if (c1 != "COMPATIBLE" || c2 != "COMPATIBLE") {
+            std::cerr << "[LD_AUDIT] ABI Incompatibility between '" << loaded_lib 
+                      << "' and '" << path << "'\n";
             
-            candidate_corpus = abigail::dwarf::read_corpus_from_elf(
-                lib_path, di_roots, g_abg_env, false, status
-            );
-            
-            if (candidate_corpus) {
-                g_corpus_cache[lib_path] = candidate_corpus;
-            }
+            // Delete the incompatible candidate corpus to free memory
+            send_cmd("DELETE " + path);
+            return nullptr;
         }
-
-        if (candidate_corpus) {
-            // Bi-directional ABI compatibility verification against all loaded objects
-            for (const auto& loaded_corpus : g_loaded_corpora) {
-                if (!loaded_corpus) continue;
-
-                // Direction 1: Loaded Object -> Candidate
-                if (g_debug_mode) {
-                    std::cerr << "[ABIAUDIT] comparing abi of " << loaded_corpus->get_path() 
-                              << " to " << lib_path << "\n";
-                }
-                if (!is_abi_compatible(loaded_corpus, candidate_corpus)) {
-                    std::cerr << "[LD_AUDIT] ABI Incompatibility: Loaded '" 
-                              << loaded_corpus->get_path() << "' expects interfaces missing/changed in candidate '" 
-                              << lib_path << "'\n";
-                    return nullptr; // Return NULL to force the linker to reject this object
-                }
-
-                // Direction 2: Candidate -> Loaded Object
-                if (g_debug_mode) {
-                    std::cerr << "[ABIAUDIT] comparing abi of " << lib_path 
-                              << " to " << loaded_corpus->get_path() << "\n";
-                }
-                if (!is_abi_compatible(candidate_corpus, loaded_corpus)) {
-                    std::cerr << "[LD_AUDIT] ABI Incompatibility: Candidate '" 
-                              << lib_path << "' expects interfaces missing/changed in loaded object '" 
-                              << loaded_corpus->get_path() << "'\n";
-                    return nullptr; 
-                }
-            }
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "[LD_AUDIT] Exception evaluating " << name << ": " << e.what() << "\n";
-        return nullptr;
-    } catch (...) {
-        std::cerr << "[LD_AUDIT] Unknown exception evaluating " << name << "\n";
-        return nullptr;
     }
 
-    // All checks passed, allow the dynamic linker to proceed with this path
     return const_cast<char*>(name);
 }
 
-// 3. Confirm object load and add to the known universe of corpora
 unsigned int la_objopen(struct link_map* map, [[maybe_unused]] Lmid_t lmid, [[maybe_unused]] uintptr_t* cookie) {
-    std::lock_guard<std::mutex> lock(g_audit_mutex);
-
-    if (g_init_complete || !map || !map->l_name || map->l_name[0] == '\0') {
+    if (g_init_complete || !map || !map->l_name || map->l_name[0] == '\0' || g_sock < 0) {
         return LA_FLG_BINDTO | LA_FLG_BINDFROM;
     }
 
-    try {
-        std::string lib_path(map->l_name);
-        
-        // If it was parsed in la_objsearch, promote it to the loaded list
-        auto it = g_corpus_cache.find(lib_path);
-        if (it != g_corpus_cache.end()) {
-            g_loaded_corpora.push_back(it->second);
-        } else if (access(lib_path.c_str(), R_OK) == 0) {
-            if (g_debug_mode) {
-                std::cerr << "[ABIAUDIT] loading corpus for " << lib_path << "\n";
-            }
-
-            // Main executable or vDSO edge cases that bypass la_objsearch
-            std::vector<std::string> di_roots;
-            abigail::fe_iface::status status = abigail::fe_iface::STATUS_UNKNOWN;
-            
-            abigail::corpus_sptr corpus = abigail::dwarf::read_corpus_from_elf(
-                lib_path, di_roots, g_abg_env, false, status
-            );
-            
-            if (corpus) {
-                g_loaded_corpora.push_back(corpus);
-            }
-        }
-    } catch (...) {
-        // Silently swallow C++ exceptions to protect the C dynamic linker
+    std::string path = map->l_name;
+    
+    // Ensure the server has it loaded (e.g., if la_objsearch was bypassed)
+    std::string resp = send_cmd("LOAD " + path);
+    if (resp == "OK") {
+        // Promote it to the official comparison list
+        send_cmd("COMMIT " + path);
     }
 
     return LA_FLG_BINDTO | LA_FLG_BINDFROM;
 }
 
-// 4. Cleanup at init_complete
 void la_preinit([[maybe_unused]] uintptr_t* cookie) {
-    std::lock_guard<std::mutex> lock(g_audit_mutex);
-    
-    // glibc init_complete probe point is passed
     g_init_complete = true;
-
-    // Free the heavy libabigail corpora from memory
-    g_loaded_corpora.clear();
-    g_corpus_cache.clear();
+    if (g_sock >= 0) {
+        std::vector<std::string> loaded_libs = get_loaded_list();
+        for (const auto& l : loaded_libs) {
+            send_cmd("DELETE " + l);
+        }
+        send_cmd("QUIT");
+        close(g_sock);
+        g_sock = -1;
+    }
 }
 
 } // extern "C"
