@@ -10,8 +10,8 @@
 
 // libabigail headers
 #include <abg-corpus.h>
-#include <abg-reader.h>        // Added for abigail::fe_iface::status
-#include <abg-dwarf-reader.h>  // Added for abigail::dwarf::read_corpus_from_elf
+#include <abg-reader.h>        
+#include <abg-dwarf-reader.h>  
 #include <abg-comparison.h>
 
 // Global state
@@ -84,7 +84,7 @@ char* la_objsearch(const char* name, uintptr_t* cookie, unsigned int flag) {
             candidate_corpus = it->second;
         } else {
             // Read DWARF into corpus using the correct API
-            std::vector<char**> di_roots; 
+            std::vector<std::string> di_roots; // FIXED: Changed from vector<char**>
             abigail::fe_iface::status status = abigail::fe_iface::STATUS_UNKNOWN;
             
             candidate_corpus = abigail::dwarf::read_corpus_from_elf(
@@ -147,7 +147,7 @@ unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
             g_loaded_corpora.push_back(it->second);
         } else if (access(lib_path.c_str(), R_OK) == 0) {
             // Main executable or vDSO edge cases that bypass la_objsearch
-            std::vector<char**> di_roots;
+            std::vector<std::string> di_roots; // FIXED: Changed from vector<char**>
             abigail::fe_iface::status status = abigail::fe_iface::STATUS_UNKNOWN;
             
             abigail::corpus_sptr corpus = abigail::dwarf::read_corpus_from_elf(
