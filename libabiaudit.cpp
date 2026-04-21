@@ -59,7 +59,7 @@ unsigned int la_version(unsigned int version) {
 }
 
 // 2. Intercept library searches to perform ABI checks
-char* la_objsearch(const char* name, uintptr_t* cookie, unsigned int flag) {
+char* la_objsearch(const char* name, [[maybe_unused]] uintptr_t* cookie, [[maybe_unused]] unsigned int flag) {
     if (!name || name[0] == '\0') return const_cast<char*>(name);
 
     std::lock_guard<std::mutex> lock(g_audit_mutex);
@@ -84,7 +84,7 @@ char* la_objsearch(const char* name, uintptr_t* cookie, unsigned int flag) {
             candidate_corpus = it->second;
         } else {
             // Read DWARF into corpus using the correct API
-            std::vector<std::string> di_roots; // FIXED: Changed from vector<char**>
+            std::vector<std::string> di_roots;
             abigail::fe_iface::status status = abigail::fe_iface::STATUS_UNKNOWN;
             
             candidate_corpus = abigail::dwarf::read_corpus_from_elf(
@@ -131,7 +131,7 @@ char* la_objsearch(const char* name, uintptr_t* cookie, unsigned int flag) {
 }
 
 // 3. Confirm object load and add to the known universe of corpora
-unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
+unsigned int la_objopen(struct link_map* map, [[maybe_unused]] Lmid_t lmid, [[maybe_unused]] uintptr_t* cookie) {
     std::lock_guard<std::mutex> lock(g_audit_mutex);
 
     if (g_init_complete || !map || !map->l_name || map->l_name[0] == '\0') {
@@ -147,7 +147,7 @@ unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
             g_loaded_corpora.push_back(it->second);
         } else if (access(lib_path.c_str(), R_OK) == 0) {
             // Main executable or vDSO edge cases that bypass la_objsearch
-            std::vector<std::string> di_roots; // FIXED: Changed from vector<char**>
+            std::vector<std::string> di_roots;
             abigail::fe_iface::status status = abigail::fe_iface::STATUS_UNKNOWN;
             
             abigail::corpus_sptr corpus = abigail::dwarf::read_corpus_from_elf(
@@ -166,7 +166,7 @@ unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
 }
 
 // 4. Cleanup at init_complete
-void la_preinit(uintptr_t* cookie) {
+void la_preinit([[maybe_unused]] uintptr_t* cookie) {
     std::lock_guard<std::mutex> lock(g_audit_mutex);
     
     // glibc init_complete probe point is passed
