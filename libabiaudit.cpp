@@ -9,6 +9,7 @@
 #include <sys/un.h>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 
 // Global IPC and Namespace state
 static std::mutex g_ipc_mutex;
@@ -16,6 +17,11 @@ static std::mutex g_namespace_mutex;
 static int g_sock = -1;
 
 static std::unordered_map<uintptr_t*, Lmid_t> g_namespace_map;
+
+// Global tracking for dlmopen wrapper
+static thread_local bool g_dlmopen_called = false;
+static thread_local Lmid_t g_dlmopen_lmid = LM_ID_BASE;
+static std::atomic<void*> g_real_dlmopen{nullptr};
 
 static std::string read_line() {
     std::string resp;
@@ -68,6 +74,41 @@ static bool is_loaded_as_audit(uintptr_t* cookie, const char* search_name) {
 
 extern "C" {
 
+// Wrapper function to intercept dlmopen calls
+void* dlmopen_wrapper(Lmid_t lmid, const char* filename, int flag) {
+    g_dlmopen_called = true;
+    g_dlmopen_lmid = lmid;
+
+    // Retrieve the real dlmopen function pointer saved by la_symbind64
+    using dlmopen_func_t = void* (*)(Lmid_t, const char*, int);
+    dlmopen_func_t real_func = reinterpret_cast<dlmopen_func_t>(g_real_dlmopen.load(std::memory_order_relaxed));
+
+    void* result = nullptr;
+    if (real_func) {
+        result = real_func(lmid, filename, flag);
+    }
+
+    // Failsafe: Clear the flag after the real dlmopen returns in case 
+    // la_objsearch never fired (e.g., if the library was already loaded).
+    g_dlmopen_called = false;
+
+    return result;
+}
+
+// Hook to intercept symbol binding and route dlmopen to our wrapper
+uintptr_t la_symbind64(Elf64_Sym *sym, [[maybe_unused]] unsigned int ndx,
+                       [[maybe_unused]] uintptr_t *refcook, [[maybe_unused]] uintptr_t *defcook,
+                       [[maybe_unused]] unsigned int *flags, const char *symname) {
+    if (symname && strcmp(symname, "dlmopen") == 0) {
+        // Save the absolute memory address of the real dlmopen dynamically
+        g_real_dlmopen.store(reinterpret_cast<void*>(sym->st_value), std::memory_order_relaxed);
+        
+        // Return the address of our wrapper so the caller jumps there instead
+        return reinterpret_cast<uintptr_t>(&dlmopen_wrapper);
+    }
+    return sym->st_value;
+}
+
 unsigned int la_version(unsigned int version) {
     if (version == 0) return 0;
 
@@ -99,13 +140,23 @@ char* la_objsearch(const char* name, uintptr_t* cookie, [[maybe_unused]] unsigne
 
     Lmid_t target_lmid = LM_ID_BASE; 
 
-    {
+    // 1. Check if this search was explicitly triggered by our dlmopen wrapper
+    if (g_dlmopen_called) {
+        target_lmid = g_dlmopen_lmid;
+        
+        // Reset the flag immediately so that dependencies evaluated natively 
+        // by the dynamic linker will correctly fall through to cookie tracking below!
+        g_dlmopen_called = false; 
+    } 
+    // 2. Track via standard cookie inheritance
+    else {
         std::lock_guard<std::mutex> lock(g_namespace_mutex);
         if (g_namespace_map.count(cookie)) {
             target_lmid = g_namespace_map[cookie];
         }
     }
 
+    // 3. Check for the DT_AUDIT override edge case
     if (is_loaded_as_audit(cookie, name)) {
         target_lmid = LM_ID_NEWLM;
     }
@@ -142,11 +193,11 @@ unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
     
     std::string resp = send_cmd("LOAD " + path);
     if (resp == "OK") {
-        // Pass LMID, the Cookie pointer as an ID, and the path
         send_cmd("COMMIT " + std::to_string(lmid) + " " + 
                  std::to_string(reinterpret_cast<uintptr_t>(cookie)) + " " + path);
     }
 
+    // Must return these flags so that la_symbind64 is invoked for this object!
     return LA_FLG_BINDTO | LA_FLG_BINDFROM;
 }
 
@@ -154,18 +205,16 @@ unsigned int la_objclose(uintptr_t* cookie) {
     if (g_sock >= 0) {
         send_cmd("DELETE_COOKIE " + std::to_string(reinterpret_cast<uintptr_t>(cookie)));
     }
-    return 0; // Return value is ignored by glibc
+    return 0; 
 }
 
 void la_preinit([[maybe_unused]] uintptr_t* cookie) {
     if (g_sock >= 0) {
         std::string resp = send_cmd("PREINIT");
         if (resp == "QUIT") {
-            // No dlopen detected, we are done. Shut down the socket.
             close(g_sock);
             g_sock = -1;
         }
-        // If "CONTINUE", g_sock remains open to audit runtime dlopen()s
     }
 }
 
