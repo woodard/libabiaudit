@@ -15,7 +15,7 @@ CLIENT_LDFLAGS = -shared
 CLIENT_LDLIBS = -ldl
 
 # Distribution settings
-DIST_FILES = abiaudit.cpp libabiaudit.cpp Makefile
+DIST_FILES = abiaudit.cpp libabiaudit.cpp Makefile README.md
 DIST_ARCHIVE = abiaudit-$(VERSION).tar.gz
 
 # Default target
