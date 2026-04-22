@@ -14,12 +14,9 @@
 static std::mutex g_ipc_mutex;
 static std::mutex g_namespace_mutex;
 static int g_sock = -1;
-static bool g_init_complete = false;
 
-// Maps an object's cookie (struct link_map*) to the namespace it was loaded into
 static std::unordered_map<uintptr_t*, Lmid_t> g_namespace_map;
 
-// Basic function to read a single newline-delimited string
 static std::string read_line() {
     std::string resp;
     char c;
@@ -30,7 +27,6 @@ static std::string read_line() {
     return resp;
 }
 
-// Function to send a command and receive a single-line response
 static std::string send_cmd_locked(const std::string& cmd) {
     if (g_sock < 0) return "ERROR";
     std::string to_send = cmd + "\n";
@@ -45,15 +41,11 @@ static std::string send_cmd(const std::string& cmd) {
     return send_cmd_locked(cmd);
 }
 
-// Helper to determine if a library search was triggered by an AUDIT tag
 static bool is_loaded_as_audit(uintptr_t* cookie, const char* search_name) {
     if (!cookie || !search_name) return false;
-
-    // In glibc, the cookie is the initiating object's link_map pointer
     struct link_map* initiating_map = reinterpret_cast<struct link_map*>(cookie);
     if (!initiating_map->l_ld) return false;
 
-    // 1. Locate the dynamic string table (DT_STRTAB)
     const char* strtab = nullptr;
     for (ElfW(Dyn)* dyn = initiating_map->l_ld; dyn->d_tag != DT_NULL; ++dyn) {
         if (dyn->d_tag == DT_STRTAB) {
@@ -63,7 +55,6 @@ static bool is_loaded_as_audit(uintptr_t* cookie, const char* search_name) {
     }
     if (!strtab) return false;
 
-    // 2. Scan for DT_AUDIT or DT_DEPAUDIT tags
     for (ElfW(Dyn)* dyn = initiating_map->l_ld; dyn->d_tag != DT_NULL; ++dyn) {
         if (dyn->d_tag == DT_AUDIT || dyn->d_tag == DT_DEPAUDIT) {
             const char* audit_target_name = strtab + dyn->d_un.d_val;
@@ -99,16 +90,15 @@ unsigned int la_version(unsigned int version) {
 }
 
 char* la_objsearch(const char* name, uintptr_t* cookie, [[maybe_unused]] unsigned int flag) {
-    if (!name || name[0] == '\0' || g_init_complete || g_sock < 0) {
+    if (!name || name[0] == '\0' || g_sock < 0) {
         return const_cast<char*>(name);
     }
     if (access(name, R_OK) != 0) {
         return const_cast<char*>(name);
     }
 
-    Lmid_t target_lmid = LM_ID_BASE; // Default assumption
+    Lmid_t target_lmid = LM_ID_BASE; 
 
-    // 1. Look up the namespace of the object initiating the search
     {
         std::lock_guard<std::mutex> lock(g_namespace_mutex);
         if (g_namespace_map.count(cookie)) {
@@ -116,25 +106,22 @@ char* la_objsearch(const char* name, uintptr_t* cookie, [[maybe_unused]] unsigne
         }
     }
 
-    // 2. If it is being loaded as an auditor, override the target to LM_ID_NEWLM
     if (is_loaded_as_audit(cookie, name)) {
         target_lmid = LM_ID_NEWLM;
     }
 
     std::string path = name;
     
-    // 3. Ask Server to load the ABI into its cache
     std::string resp = send_cmd("LOAD " + path);
     if (resp != "OK") return nullptr; 
 
-    // 4. Command Server to do the heavy lifting: compare against the target namespace
     resp = send_cmd("CHECK " + std::to_string(target_lmid) + " " + path);
 
     if (resp != "COMPATIBLE") {
         std::cerr << "[LD_AUDIT] ABI Incompatibility detected for '" << path 
                   << "' in namespace " << target_lmid << "\n";
         
-        send_cmd("DELETE " + path);
+        send_cmd("DELETE_PATH " + path);
         return nullptr;
     }
 
@@ -142,12 +129,10 @@ char* la_objsearch(const char* name, uintptr_t* cookie, [[maybe_unused]] unsigne
 }
 
 unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
-    if (g_init_complete || !map || !map->l_name || map->l_name[0] == '\0' || g_sock < 0) {
+    if (!map || !map->l_name || map->l_name[0] == '\0' || g_sock < 0) {
         return LA_FLG_BINDTO | LA_FLG_BINDFROM;
     }
 
-    // Record the assigned namespace for this object's cookie so future searches
-    // initiated by this object resolve to the correct namespace
     {
         std::lock_guard<std::mutex> lock(g_namespace_mutex);
         g_namespace_map[cookie] = lmid;
@@ -155,21 +140,32 @@ unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
 
     std::string path = map->l_name;
     
-    // Ensure the server has it loaded, then commit it to the specific lmid's list
     std::string resp = send_cmd("LOAD " + path);
     if (resp == "OK") {
-        send_cmd("COMMIT " + std::to_string(lmid) + " " + path);
+        // Pass LMID, the Cookie pointer as an ID, and the path
+        send_cmd("COMMIT " + std::to_string(lmid) + " " + 
+                 std::to_string(reinterpret_cast<uintptr_t>(cookie)) + " " + path);
     }
 
     return LA_FLG_BINDTO | LA_FLG_BINDFROM;
 }
 
-void la_preinit([[maybe_unused]] uintptr_t* cookie) {
-    g_init_complete = true;
+unsigned int la_objclose(uintptr_t* cookie) {
     if (g_sock >= 0) {
-        send_cmd("QUIT");
-        close(g_sock);
-        g_sock = -1;
+        send_cmd("DELETE_COOKIE " + std::to_string(reinterpret_cast<uintptr_t>(cookie)));
+    }
+    return 0; // Return value is ignored by glibc
+}
+
+void la_preinit([[maybe_unused]] uintptr_t* cookie) {
+    if (g_sock >= 0) {
+        std::string resp = send_cmd("PREINIT");
+        if (resp == "QUIT") {
+            // No dlopen detected, we are done. Shut down the socket.
+            close(g_sock);
+            g_sock = -1;
+        }
+        // If "CONTINUE", g_sock remains open to audit runtime dlopen()s
     }
 }
 

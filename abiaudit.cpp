@@ -10,7 +10,12 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
-#include <link.h> // For Lmid_t and LM_ID_NEWLM
+#include <fcntl.h>
+#include <link.h>
+
+// elfutils headers for .dynsym parsing
+#include <libelf.h>
+#include <gelf.h>
 
 // libabigail headers
 #include <abg-corpus.h>
@@ -34,13 +39,58 @@ static bool is_abi_compatible(const abigail::corpus_sptr& obj1,
     return !diff->has_incompatible_changes();
 }
 
+// Scans the .dynsym section of an ELF file for "dlopen" or "dlmopen"
+static bool check_for_dlopen(const std::string& path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    
+    if (elf_version(EV_CURRENT) == EV_NONE) {
+        close(fd);
+        return false;
+    }
+
+    Elf* elf = elf_begin(fd, ELF_C_READ, nullptr);
+    if (!elf) {
+        close(fd);
+        return false;
+    }
+
+    bool found = false;
+    Elf_Scn* scn = nullptr;
+    GElf_Shdr shdr;
+
+    while ((scn = elf_nextscn(elf, scn)) != nullptr) {
+        if (gelf_getshdr(scn, &shdr) != &shdr) continue;
+        
+        if (shdr.sh_type == SHT_DYNSYM) {
+            Elf_Data* data = elf_getdata(scn, nullptr);
+            int count = shdr.sh_size / shdr.sh_entsize;
+            
+            for (int i = 0; i < count; ++i) {
+                GElf_Sym sym;
+                gelf_getsym(data, i, &sym);
+                const char* name = elf_strptr(elf, shdr.sh_link, sym.st_name);
+                
+                if (name && (strcmp(name, "dlopen") == 0 || strcmp(name, "dlmopen") == 0)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (found) break;
+    }
+
+    elf_end(elf);
+    close(fd);
+    return found;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <target_program> [args...]\n";
         return 1;
     }
 
-    // 1. Create a Unix Domain Socket
     int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket");
@@ -65,7 +115,6 @@ int main(int argc, char** argv) {
 
     setenv("ABIAUDIT_SOCKET", sock_path.c_str(), 1);
 
-    // 2. Fork and launch target program
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
@@ -73,14 +122,12 @@ int main(int argc, char** argv) {
     }
 
     if (pid == 0) {
-        // Isolate LD_AUDIT strictly to the child process
         setenv("LD_AUDIT", "./libabiaudit.so", 1); 
         execvp(argv[1], &argv[1]);
         perror("execvp");
         exit(1);
     }
 
-    // 3. Parent Process: Server Loop
     int client_fd = accept(server_fd, nullptr, nullptr);
     if (client_fd < 0) {
         perror("accept");
@@ -93,9 +140,13 @@ int main(int argc, char** argv) {
 
     abigail::ir::environment env;
     std::unordered_map<std::string, abigail::corpus_sptr> corpora;
-    
-    // Namespace separation map: Lmid_t -> List of Loaded Libraries
     std::unordered_map<Lmid_t, std::vector<std::string>> loaded_lists;
+    
+    // Track cookie -> {lmid, path} for la_objclose tracking
+    std::unordered_map<uintptr_t, std::pair<Lmid_t, std::string>> cookie_map;
+
+    bool uses_dlopen = false;
+    bool wait_for_child = true;
 
     char line[4096];
     while (fgets(line, sizeof(line), stream)) {
@@ -127,20 +178,15 @@ int main(int argc, char** argv) {
             std::string path = args.substr(sep + 1);
             
             if (lmid == LM_ID_NEWLM) {
-                // If it's destined for a new namespace, there are no existing
-                // objects in that namespace to be incompatible with.
                 fprintf(stream, "COMPATIBLE\n");
             } else {
                 bool compatible = true;
                 if (corpora.count(path)) {
                     auto candidate = corpora[path];
-                    
-                    // Iterate and compare ONLY against libraries in the target namespace
                     for (const auto& loaded_path : loaded_lists[lmid]) {
                         if (loaded_path == path) continue;
                         auto loaded = corpora[loaded_path];
                         
-                        // Bi-directional check
                         if (!is_abi_compatible(loaded, candidate) || 
                             !is_abi_compatible(candidate, loaded)) {
                             compatible = false;
@@ -154,33 +200,51 @@ int main(int argc, char** argv) {
             }
         } 
         else if (cmd == "COMMIT") {
-            size_t sep = args.find(' ');
-            Lmid_t lmid = std::stoll(args.substr(0, sep));
-            std::string path = args.substr(sep + 1);
+            size_t sep1 = args.find(' ');
+            size_t sep2 = args.find(' ', sep1 + 1);
+            
+            Lmid_t lmid = std::stoll(args.substr(0, sep1));
+            uintptr_t cookie = std::stoull(args.substr(sep1 + 1, sep2 - sep1 - 1));
+            std::string path = args.substr(sep2 + 1);
             
             auto& list = loaded_lists[lmid];
             if (std::find(list.begin(), list.end(), path) == list.end()) {
                 list.push_back(path);
             }
+            cookie_map[cookie] = {lmid, path};
+
+            // Analyze for dlopen/dlmopen if we haven't found it already
+            if (!uses_dlopen && check_for_dlopen(path)) {
+                uses_dlopen = true;
+            }
+
             fprintf(stream, "OK\n");
         } 
-        else if (cmd == "DELETE") {
+        else if (cmd == "DELETE_COOKIE") { // Called by la_objclose
+            uintptr_t cookie = std::stoull(args);
+            if (cookie_map.count(cookie)) {
+                Lmid_t lmid = cookie_map[cookie].first;
+                std::string path = cookie_map[cookie].second;
+                
+                auto& list = loaded_lists[lmid];
+                list.erase(std::remove(list.begin(), list.end(), path), list.end());
+                cookie_map.erase(cookie);
+            }
+            fprintf(stream, "OK\n");
+        }
+        else if (cmd == "DELETE_PATH") { // Called by la_objsearch on rejection
             corpora.erase(args);
-            // Erase from all namespaces if present
-            for (auto& pair : loaded_lists) {
-                auto& list = pair.second;
-                list.erase(std::remove(list.begin(), list.end(), args), list.end());
-            }
             fprintf(stream, "OK\n");
-        } 
-        else if (cmd == "LIST") {
-            Lmid_t lmid = std::stoll(args);
-            fprintf(stream, "LIST_START\n");
-            for (const auto& l : loaded_lists[lmid]) {
-                fprintf(stream, "%s\n", l.c_str());
+        }
+        else if (cmd == "PREINIT") {
+            if (uses_dlopen) {
+                fprintf(stream, "CONTINUE\n");
+            } else {
+                fprintf(stream, "QUIT\n");
+                wait_for_child = false; // We will exit and naturally reparent the child
+                break;
             }
-            fprintf(stream, "LIST_END\n");
-        } 
+        }
         else if (cmd == "QUIT") {
             break;
         }
@@ -190,7 +254,11 @@ int main(int argc, char** argv) {
     fclose(stream);
     close(server_fd);
     unlink(sock_path.c_str());
-    waitpid(pid, nullptr, 0);
+
+    // If wait_for_child is false, exiting here leaves the child to keep running under init (PID 1).
+    if (wait_for_child) {
+        waitpid(pid, nullptr, 0);
+    }
 
     return 0;
 }
