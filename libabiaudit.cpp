@@ -197,8 +197,18 @@ unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
                  std::to_string(reinterpret_cast<uintptr_t>(cookie)) + " " + path);
     }
 
-    // Must return these flags so that la_symbind64 is invoked for this object!
-    return LA_FLG_BINDTO | LA_FLG_BINDFROM;
+    // Optimization: Only request la_symbind64 callbacks for symbols bound TO 
+    // libdl or libc (since glibc 2.34 merged libdl into libc).
+    if (strstr(path.c_str(), "/libdl.so") != nullptr || 
+        strstr(path.c_str(), "/libc.so") != nullptr ||
+        strncmp(path.c_str(), "libdl.so", 8) == 0 ||
+        strncmp(path.c_str(), "libc.so", 7) == 0) {
+        
+        return LA_FLG_BINDTO;
+    }
+
+    // For all other libraries, return 0. We do not need to intercept their symbols.
+    return 0;
 }
 
 unsigned int la_objclose(uintptr_t* cookie) {
