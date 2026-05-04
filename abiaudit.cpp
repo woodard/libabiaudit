@@ -24,10 +24,18 @@
 #include <abg-comparison.h>
 
 static bool is_abi_compatible(const abigail::corpus_sptr& obj1, 
-                              const abigail::corpus_sptr& obj2) {
+                              const abigail::corpus_sptr& obj2,
+                              bool verbose_mode) {
     if (!obj1 || !obj2) return true;
 
     abigail::comparison::diff_context_sptr diff_ctxt(new abigail::comparison::diff_context());
+    
+    // Mimic abicompat's default output formatting settings
+    diff_ctxt->show_added_fns(false);
+    diff_ctxt->show_added_vars(false);
+    diff_ctxt->show_linkage_names(true);
+    diff_ctxt->show_locs(true);
+    
     diff_ctxt->switch_categories_off(
         abigail::comparison::get_default_harmless_categories_bitmap()
     );
@@ -36,7 +44,21 @@ static bool is_abi_compatible(const abigail::corpus_sptr& obj1,
         abigail::comparison::compute_diff(obj1, obj2, diff_ctxt);
 
     if (!diff) return true;
-    return !diff->has_incompatible_changes();
+    
+    bool is_incompatible = diff->has_incompatible_changes();
+
+    // If verbose mode is on and we found a break, print it using abicompat's format
+    if (is_incompatible && verbose_mode) {
+        std::cerr << "ELF file '" << obj2->get_path() 
+                  << "' is not ABI compatible with '" << obj1->get_path() 
+                  << "' due to differences below:\n";
+        
+        // This generates the standard libabigail diff tree report
+        diff->report(std::cerr);
+        std::cerr << "\n";
+    }
+
+    return !is_incompatible;
 }
 
 // Scans the .dynsym section of an ELF file for "dlopen" or "dlmopen"
@@ -139,7 +161,6 @@ int main(int argc, char** argv) {
 
     if (pid == 0) {
         setenv("LD_AUDIT", "./libabiaudit.so", 1); 
-        // Launch the target program, starting at the first non-option argument
         execvp(argv[optind], &argv[optind]);
         perror("execvp");
         exit(1);
@@ -208,8 +229,8 @@ int main(int argc, char** argv) {
                         if (loaded_path == path) continue;
                         auto loaded = corpora[loaded_path];
                         
-                        if (!is_abi_compatible(loaded, candidate) || 
-                            !is_abi_compatible(candidate, loaded)) {
+                        if (!is_abi_compatible(loaded, candidate, verbose_mode) || 
+                            !is_abi_compatible(candidate, loaded, verbose_mode)) {
                             compatible = false;
                             break;
                         }
@@ -234,7 +255,6 @@ int main(int argc, char** argv) {
             }
             cookie_map[cookie] = {lmid, path};
 
-            // Analyze for dlopen/dlmopen if we haven't found it already
             if (!uses_dlopen && check_for_dlopen(path)) {
                 uses_dlopen = true;
             }
