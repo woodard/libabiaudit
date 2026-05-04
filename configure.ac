@@ -26,5 +26,5 @@ AC_CHECK_LIB([elf], [elf_version], [], [
     AC_MSG_ERROR([libelf is required but could not be found.])
 ])
 
-AC_CONFIG_FILES([Makefile])
+AC_CONFIG_FILES([Makefile test/Makefile])
 AC_OUTPUT

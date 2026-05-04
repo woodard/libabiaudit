@@ -1,3 +1,5 @@
+SUBDIRS = . test
+
 # 1. Build the server executable
 bin_PROGRAMS = abiaudit
 
