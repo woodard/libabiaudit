@@ -86,8 +86,24 @@ static bool check_for_dlopen(const std::string& path) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <target_program> [args...]\n";
+    bool verbose_mode = false;
+    int opt;
+
+    // Parse command line arguments
+    while ((opt = getopt(argc, argv, "v")) != -1) {
+        switch (opt) {
+            case 'v':
+                verbose_mode = true;
+                break;
+            default:
+                std::cerr << "Usage: " << argv[0] << " [-v] <target_program> [args...]\n";
+                return 1;
+        }
+    }
+
+    // Ensure a target program was provided after the options
+    if (optind >= argc) {
+        std::cerr << "Usage: " << argv[0] << " [-v] <target_program> [args...]\n";
         return 1;
     }
 
@@ -123,7 +139,8 @@ int main(int argc, char** argv) {
 
     if (pid == 0) {
         setenv("LD_AUDIT", "./libabiaudit.so", 1); 
-        execvp(argv[1], &argv[1]);
+        // Launch the target program, starting at the first non-option argument
+        execvp(argv[optind], &argv[optind]);
         perror("execvp");
         exit(1);
     }
@@ -152,6 +169,10 @@ int main(int argc, char** argv) {
     while (fgets(line, sizeof(line), stream)) {
         std::string req(line);
         if (!req.empty() && req.back() == '\n') req.pop_back();
+
+        if (verbose_mode) {
+            std::cerr << "[SERVER] Received command: " << req << "\n";
+        }
 
         size_t first_space = req.find(' ');
         std::string cmd = req.substr(0, first_space);
@@ -220,7 +241,7 @@ int main(int argc, char** argv) {
 
             fprintf(stream, "OK\n");
         } 
-        else if (cmd == "DELETE_COOKIE") { // Called by la_objclose
+        else if (cmd == "DELETE_COOKIE") { 
             uintptr_t cookie = std::stoull(args);
             if (cookie_map.count(cookie)) {
                 Lmid_t lmid = cookie_map[cookie].first;
@@ -232,7 +253,7 @@ int main(int argc, char** argv) {
             }
             fprintf(stream, "OK\n");
         }
-        else if (cmd == "DELETE_PATH") { // Called by la_objsearch on rejection
+        else if (cmd == "DELETE_PATH") { 
             corpora.erase(args);
             fprintf(stream, "OK\n");
         }
@@ -241,7 +262,7 @@ int main(int argc, char** argv) {
                 fprintf(stream, "CONTINUE\n");
             } else {
                 fprintf(stream, "QUIT\n");
-                wait_for_child = false; // We will exit and naturally reparent the child
+                wait_for_child = false; 
                 break;
             }
         }
@@ -255,7 +276,6 @@ int main(int argc, char** argv) {
     close(server_fd);
     unlink(sock_path.c_str());
 
-    // If wait_for_child is false, exiting here leaves the child to keep running under init (PID 1).
     if (wait_for_child) {
         waitpid(pid, nullptr, 0);
     }

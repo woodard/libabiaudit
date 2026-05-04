@@ -17,6 +17,8 @@ static std::mutex g_namespace_mutex;
 static int g_sock = -1;
 
 static std::unordered_map<uintptr_t*, Lmid_t> g_namespace_map;
+// Track how many libraries are successfully loaded in each namespace
+static std::unordered_map<Lmid_t, size_t> g_namespace_counts;
 
 // Global tracking for dlmopen wrapper
 static thread_local bool g_dlmopen_called = false;
@@ -45,6 +47,23 @@ static std::string send_cmd_locked(const std::string& cmd) {
 static std::string send_cmd(const std::string& cmd) {
     std::lock_guard<std::mutex> lock(g_ipc_mutex);
     return send_cmd_locked(cmd);
+}
+
+// Helper to filter out system libraries that do not need ABI auditing
+static bool is_ignored_library(const char* name) {
+    if (!name) return false;
+    
+    // Ignore vDSO
+    if (strstr(name, "linux-vdso") != nullptr || strstr(name, "linux-gate") != nullptr) {
+        return true;
+    }
+    
+    // Ignore the dynamic linker itself
+    if (strstr(name, "ld-linux") != nullptr || strstr(name, "ld.so") != nullptr) {
+        return true;
+    }
+    
+    return false;
 }
 
 static bool is_loaded_as_audit(uintptr_t* cookie, const char* search_name) {
@@ -79,7 +98,6 @@ void* dlmopen_wrapper(Lmid_t lmid, const char* filename, int flag) {
     g_dlmopen_called = true;
     g_dlmopen_lmid = lmid;
 
-    // Retrieve the real dlmopen function pointer saved by la_symbind64
     using dlmopen_func_t = void* (*)(Lmid_t, const char*, int);
     dlmopen_func_t real_func = reinterpret_cast<dlmopen_func_t>(g_real_dlmopen.load(std::memory_order_relaxed));
 
@@ -88,22 +106,15 @@ void* dlmopen_wrapper(Lmid_t lmid, const char* filename, int flag) {
         result = real_func(lmid, filename, flag);
     }
 
-    // Failsafe: Clear the flag after the real dlmopen returns in case 
-    // la_objsearch never fired (e.g., if the library was already loaded).
     g_dlmopen_called = false;
-
     return result;
 }
 
-// Hook to intercept symbol binding and route dlmopen to our wrapper
 uintptr_t la_symbind64(Elf64_Sym *sym, [[maybe_unused]] unsigned int ndx,
                        [[maybe_unused]] uintptr_t *refcook, [[maybe_unused]] uintptr_t *defcook,
                        [[maybe_unused]] unsigned int *flags, const char *symname) {
     if (symname && strcmp(symname, "dlmopen") == 0) {
-        // Save the absolute memory address of the real dlmopen dynamically
         g_real_dlmopen.store(reinterpret_cast<void*>(sym->st_value), std::memory_order_relaxed);
-        
-        // Return the address of our wrapper so the caller jumps there instead
         return reinterpret_cast<uintptr_t>(&dlmopen_wrapper);
     }
     return sym->st_value;
@@ -134,31 +145,46 @@ char* la_objsearch(const char* name, uintptr_t* cookie, [[maybe_unused]] unsigne
     if (!name || name[0] == '\0' || g_sock < 0) {
         return const_cast<char*>(name);
     }
+    
+    if (is_ignored_library(name)) {
+        return const_cast<char*>(name);
+    }
+
     if (access(name, R_OK) != 0) {
         return const_cast<char*>(name);
     }
 
     Lmid_t target_lmid = LM_ID_BASE; 
 
-    // 1. Check if this search was explicitly triggered by our dlmopen wrapper
     if (g_dlmopen_called) {
         target_lmid = g_dlmopen_lmid;
-        
-        // Reset the flag immediately so that dependencies evaluated natively 
-        // by the dynamic linker will correctly fall through to cookie tracking below!
         g_dlmopen_called = false; 
-    } 
-    // 2. Track via standard cookie inheritance
-    else {
+    } else {
         std::lock_guard<std::mutex> lock(g_namespace_mutex);
         if (g_namespace_map.count(cookie)) {
             target_lmid = g_namespace_map[cookie];
         }
     }
 
-    // 3. Check for the DT_AUDIT override edge case
     if (is_loaded_as_audit(cookie, name)) {
         target_lmid = LM_ID_NEWLM;
+    }
+
+    // Optimization: if this is the very first library being evaluated for 
+    // this namespace, skip the CHECK entirely because it's empty.
+    bool is_first_library = false;
+    if (target_lmid == LM_ID_NEWLM) {
+        is_first_library = true;
+    } else {
+        std::lock_guard<std::mutex> lock(g_namespace_mutex);
+        if (g_namespace_counts[target_lmid] == 0) {
+            is_first_library = true;
+        }
+    }
+
+    if (is_first_library) {
+        // Just let it load. It will be COMMITTED in la_objopen.
+        return const_cast<char*>(name);
     }
 
     std::string path = name;
@@ -181,7 +207,11 @@ char* la_objsearch(const char* name, uintptr_t* cookie, [[maybe_unused]] unsigne
 
 unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
     if (!map || !map->l_name || map->l_name[0] == '\0' || g_sock < 0) {
-        return LA_FLG_BINDTO | LA_FLG_BINDFROM;
+        return 0; 
+    }
+
+    if (is_ignored_library(map->l_name)) {
+        return 0;
     }
 
     {
@@ -195,10 +225,12 @@ unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
     if (resp == "OK") {
         send_cmd("COMMIT " + std::to_string(lmid) + " " + 
                  std::to_string(reinterpret_cast<uintptr_t>(cookie)) + " " + path);
+                 
+        // Increment the committed count for this namespace
+        std::lock_guard<std::mutex> lock(g_namespace_mutex);
+        g_namespace_counts[lmid]++;
     }
 
-    // Optimization: Only request la_symbind64 callbacks for symbols bound TO 
-    // libdl or libc (since glibc 2.34 merged libdl into libc).
     if (strstr(path.c_str(), "/libdl.so") != nullptr || 
         strstr(path.c_str(), "/libc.so") != nullptr ||
         strncmp(path.c_str(), "libdl.so", 8) == 0 ||
@@ -207,13 +239,22 @@ unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
         return LA_FLG_BINDTO;
     }
 
-    // For all other libraries, return 0. We do not need to intercept their symbols.
     return 0;
 }
 
 unsigned int la_objclose(uintptr_t* cookie) {
     if (g_sock >= 0) {
         send_cmd("DELETE_COOKIE " + std::to_string(reinterpret_cast<uintptr_t>(cookie)));
+        
+        // Clean up our local namespace tracking maps
+        std::lock_guard<std::mutex> lock(g_namespace_mutex);
+        if (g_namespace_map.count(cookie)) {
+            Lmid_t lmid = g_namespace_map[cookie];
+            if (g_namespace_counts[lmid] > 0) {
+                g_namespace_counts[lmid]--;
+            }
+            g_namespace_map.erase(cookie);
+        }
     }
     return 0; 
 }
