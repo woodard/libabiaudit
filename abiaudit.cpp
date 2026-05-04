@@ -23,7 +23,6 @@
 #include <abg-dwarf-reader.h>
 #include <abg-comparison.h>
 
-// Verifies that the interfaces expected by the first corpus are safely provided by the second corpus
 static bool is_abi_compatible(const abigail::corpus_sptr& expected_corpus, 
                               const abigail::corpus_sptr& provided_corpus,
                               bool verbose_mode) {
@@ -42,7 +41,6 @@ static bool is_abi_compatible(const abigail::corpus_sptr& expected_corpus,
 
     bool is_compatible = true;
 
-    // 1. Compare Functions expected by the consumer against those provided by the supplier
     for (const auto& expected_fn : expected_corpus->get_sorted_undefined_functions()) {
         abigail::interned_string fn_id = expected_fn->get_id();
         const std::unordered_set<abigail::ir::function_decl*>* exported_fns = 
@@ -75,7 +73,6 @@ static bool is_abi_compatible(const abigail::corpus_sptr& expected_corpus,
         }
     }
 
-    // 2. Compare Variables expected by the consumer against those provided by the supplier
     for (const auto& expected_var : expected_corpus->get_sorted_undefined_variables()) {
         abigail::interned_string var_id = expected_var->get_id();
         const std::unordered_set<abigail::ir::var_decl_sptr>* exported_vars = 
@@ -110,7 +107,6 @@ static bool is_abi_compatible(const abigail::corpus_sptr& expected_corpus,
     return is_compatible;
 }
 
-// Scans the .dynsym section of an ELF file for "dlopen" or "dlmopen"
 static bool check_for_dlopen(const std::string& path) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) return false;
@@ -158,21 +154,25 @@ static bool check_for_dlopen(const std::string& path) {
 
 int main(int argc, char** argv) {
     bool verbose_mode = false;
+    bool exit_main = false;
     int opt;
 
-    while ((opt = getopt(argc, argv, "v")) != -1) {
+    while ((opt = getopt(argc, argv, "ve")) != -1) {
         switch (opt) {
             case 'v':
                 verbose_mode = true;
                 break;
+            case 'e':
+                exit_main = true;
+                break;
             default:
-                std::cerr << "Usage: " << argv[0] << " [-v] <target_program> [args...]\n";
+                std::cerr << "Usage: " << argv[0] << " [-v] [-e] <target_program> [args...]\n";
                 return 1;
         }
     }
 
     if (optind >= argc) {
-        std::cerr << "Usage: " << argv[0] << " [-v] <target_program> [args...]\n";
+        std::cerr << "Usage: " << argv[0] << " [-v] [-e] <target_program> [args...]\n";
         return 1;
     }
 
@@ -208,6 +208,9 @@ int main(int argc, char** argv) {
 
     if (pid == 0) {
         setenv("LD_AUDIT", "./libabiaudit.so", 1); 
+        if (exit_main) {
+            setenv("ABIAUDIT_EXIT_MAIN", "1", 1);
+        }
         execvp(argv[optind], &argv[optind]);
         perror("execvp");
         exit(1);
@@ -275,9 +278,6 @@ int main(int argc, char** argv) {
                         if (loaded_path == path) continue;
                         auto loaded = corpora[loaded_path];
                         
-                        // Because we are now doing expect-driven checks, the bi-directional 
-                        // check correctly asks: "Does the candidate break expectations of the loaded?"
-                        // AND "Does the loaded break expectations of the candidate?"
                         if (!is_abi_compatible(loaded, candidate, verbose_mode) || 
                             !is_abi_compatible(candidate, loaded, verbose_mode)) {
                             compatible = false;

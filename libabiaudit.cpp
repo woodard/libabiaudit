@@ -17,13 +17,15 @@ static std::mutex g_namespace_mutex;
 static int g_sock = -1;
 
 static std::unordered_map<uintptr_t*, Lmid_t> g_namespace_map;
-// Track how many libraries are successfully loaded in each namespace
 static std::unordered_map<Lmid_t, size_t> g_namespace_counts;
 
-// Global tracking for dlmopen wrapper
+// Global tracking for wrappers
 static thread_local bool g_dlmopen_called = false;
 static thread_local Lmid_t g_dlmopen_lmid = LM_ID_BASE;
 static std::atomic<void*> g_real_dlmopen{nullptr};
+
+static bool g_exit_main = false;
+static std::atomic<void*> g_real_libc_start_main{nullptr};
 
 static std::string read_line() {
     std::string resp;
@@ -49,20 +51,10 @@ static std::string send_cmd(const std::string& cmd) {
     return send_cmd_locked(cmd);
 }
 
-// Helper to filter out system libraries that do not need ABI auditing
 static bool is_ignored_library(const char* name) {
     if (!name) return false;
-    
-    // Ignore vDSO
-    if (strstr(name, "linux-vdso") != nullptr || strstr(name, "linux-gate") != nullptr) {
-        return true;
-    }
-    
-    // Ignore the dynamic linker itself
-    if (strstr(name, "ld-linux") != nullptr || strstr(name, "ld.so") != nullptr) {
-        return true;
-    }
-    
+    if (strstr(name, "linux-vdso") != nullptr || strstr(name, "linux-gate") != nullptr) return true;
+    if (strstr(name, "ld-linux") != nullptr || strstr(name, "ld.so") != nullptr) return true;
     return false;
 }
 
@@ -83,9 +75,7 @@ static bool is_loaded_as_audit(uintptr_t* cookie, const char* search_name) {
     for (ElfW(Dyn)* dyn = initiating_map->l_ld; dyn->d_tag != DT_NULL; ++dyn) {
         if (dyn->d_tag == DT_AUDIT || dyn->d_tag == DT_DEPAUDIT) {
             const char* audit_target_name = strtab + dyn->d_un.d_val;
-            if (strstr(search_name, audit_target_name) != nullptr) {
-                return true;
-            }
+            if (strstr(search_name, audit_target_name) != nullptr) return true;
         }
     }
     return false;
@@ -93,7 +83,6 @@ static bool is_loaded_as_audit(uintptr_t* cookie, const char* search_name) {
 
 extern "C" {
 
-// Wrapper function to intercept dlmopen calls
 void* dlmopen_wrapper(Lmid_t lmid, const char* filename, int flag) {
     g_dlmopen_called = true;
     g_dlmopen_lmid = lmid;
@@ -110,18 +99,56 @@ void* dlmopen_wrapper(Lmid_t lmid, const char* filename, int flag) {
     return result;
 }
 
+// The fake main function that simply exits
+int fake_main([[maybe_unused]] int argc, [[maybe_unused]] char** argv, [[maybe_unused]] char** envp) {
+    std::cerr << "[LD_AUDIT] The program was not run.\n";
+    exit(0);
+    return 0; // Unreachable
+}
+
+// Wrapper for __libc_start_main to inject the fake main
+int wrapper_libc_start_main(
+    [[maybe_unused]] int (*main) (int, char**, char**), 
+    int argc, 
+    char** ubp_av, 
+    void (*init) (void), 
+    void (*fini) (void), 
+    void (*rtld_fini) (void), 
+    void* stack_end) 
+{
+    std::cerr << "[LD_AUDIT] wrapper_libc_start_main called, substituting fake_main.\n";
+    using libc_start_main_func_t = int (*)(int (*) (int, char**, char**), int, char**, void (*) (void), void (*) (void), void (*) (void), void*);
+    libc_start_main_func_t real_func = reinterpret_cast<libc_start_main_func_t>(g_real_libc_start_main.load(std::memory_order_relaxed));
+    
+    // Call the real __libc_start_main, but supply our fake_main pointer
+    return real_func(fake_main, argc, ubp_av, init, fini, rtld_fini, stack_end);
+}
+
 uintptr_t la_symbind64(Elf64_Sym *sym, [[maybe_unused]] unsigned int ndx,
                        [[maybe_unused]] uintptr_t *refcook, [[maybe_unused]] uintptr_t *defcook,
                        [[maybe_unused]] unsigned int *flags, const char *symname) {
-    if (symname && strcmp(symname, "dlmopen") == 0) {
+    if (!symname) return sym->st_value;
+
+    if (strcmp(symname, "dlmopen") == 0) {
         g_real_dlmopen.store(reinterpret_cast<void*>(sym->st_value), std::memory_order_relaxed);
         return reinterpret_cast<uintptr_t>(&dlmopen_wrapper);
     }
+    
+    if (g_exit_main && strcmp(symname, "__libc_start_main") == 0) {
+        std::cerr << "[LD_AUDIT] la_symbind64 intercepted __libc_start_main symbol.\n";
+        g_real_libc_start_main.store(reinterpret_cast<void*>(sym->st_value), std::memory_order_relaxed);
+        return reinterpret_cast<uintptr_t>(&wrapper_libc_start_main);
+    }
+
     return sym->st_value;
 }
 
 unsigned int la_version(unsigned int version) {
     if (version == 0) return 0;
+
+    if (getenv("ABIAUDIT_EXIT_MAIN")) {
+        g_exit_main = true;
+    }
 
     const char* sock_path = getenv("ABIAUDIT_SOCKET");
     if (sock_path) {
@@ -170,8 +197,6 @@ char* la_objsearch(const char* name, uintptr_t* cookie, [[maybe_unused]] unsigne
         target_lmid = LM_ID_NEWLM;
     }
 
-    // Optimization: if this is the very first library being evaluated for 
-    // this namespace, skip the CHECK entirely because it's empty.
     bool is_first_library = false;
     if (target_lmid == LM_ID_NEWLM) {
         is_first_library = true;
@@ -183,7 +208,6 @@ char* la_objsearch(const char* name, uintptr_t* cookie, [[maybe_unused]] unsigne
     }
 
     if (is_first_library) {
-        // Just let it load. It will be COMMITTED in la_objopen.
         return const_cast<char*>(name);
     }
 
@@ -226,7 +250,6 @@ unsigned int la_objopen(struct link_map* map, Lmid_t lmid, uintptr_t* cookie) {
         send_cmd("COMMIT " + std::to_string(lmid) + " " + 
                  std::to_string(reinterpret_cast<uintptr_t>(cookie)) + " " + path);
                  
-        // Increment the committed count for this namespace
         std::lock_guard<std::mutex> lock(g_namespace_mutex);
         g_namespace_counts[lmid]++;
     }
@@ -246,7 +269,6 @@ unsigned int la_objclose(uintptr_t* cookie) {
     if (g_sock >= 0) {
         send_cmd("DELETE_COOKIE " + std::to_string(reinterpret_cast<uintptr_t>(cookie)));
         
-        // Clean up our local namespace tracking maps
         std::lock_guard<std::mutex> lock(g_namespace_mutex);
         if (g_namespace_map.count(cookie)) {
             Lmid_t lmid = g_namespace_map[cookie];
