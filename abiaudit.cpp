@@ -23,14 +23,14 @@
 #include <abg-dwarf-reader.h>
 #include <abg-comparison.h>
 
-static bool is_abi_compatible(const abigail::corpus_sptr& obj1, 
-                              const abigail::corpus_sptr& obj2,
+// Verifies that the interfaces expected by the first corpus are safely provided by the second corpus
+static bool is_abi_compatible(const abigail::corpus_sptr& expected_corpus, 
+                              const abigail::corpus_sptr& provided_corpus,
                               bool verbose_mode) {
-    if (!obj1 || !obj2) return true;
+    if (!expected_corpus || !provided_corpus) return true;
 
     abigail::comparison::diff_context_sptr diff_ctxt(new abigail::comparison::diff_context());
     
-    // Mimic abicompat's default output formatting settings
     diff_ctxt->show_added_fns(false);
     diff_ctxt->show_added_vars(false);
     diff_ctxt->show_linkage_names(true);
@@ -40,25 +40,74 @@ static bool is_abi_compatible(const abigail::corpus_sptr& obj1,
         abigail::comparison::get_default_harmless_categories_bitmap()
     );
 
-    abigail::comparison::corpus_diff_sptr diff = 
-        abigail::comparison::compute_diff(obj1, obj2, diff_ctxt);
+    bool is_compatible = true;
 
-    if (!diff) return true;
-    
-    bool is_incompatible = diff->has_incompatible_changes();
-
-    // If verbose mode is on and we found a break, print it using abicompat's format
-    if (is_incompatible && verbose_mode) {
-        std::cerr << "ELF file '" << obj2->get_path() 
-                  << "' is not ABI compatible with '" << obj1->get_path() 
-                  << "' due to differences below:\n";
+    // 1. Compare Functions expected by the consumer against those provided by the supplier
+    for (const auto& expected_fn : expected_corpus->get_sorted_undefined_functions()) {
+        abigail::interned_string fn_id = expected_fn->get_id();
+        const std::unordered_set<abigail::ir::function_decl*>* exported_fns = 
+            provided_corpus->lookup_functions(fn_id);
         
-        // This generates the standard libabigail diff tree report
-        diff->report(std::cerr);
-        std::cerr << "\n";
+        if (exported_fns) {
+            for (auto exported_fn : *exported_fns) {
+                abigail::comparison::function_type_diff_sptr fn_type_diff =
+                    abigail::comparison::compute_diff(expected_fn->get_type(),
+                                                      exported_fn->get_type(),
+                                                      diff_ctxt);
+                
+                abigail::comparison::diff_sptr diff_tree = abigail::comparison::is_diff(fn_type_diff);
+                if (diff_tree) {
+                    abigail::comparison::apply_filters_and_categorize_diff_node_tree(diff_tree);
+                }
+                
+                if (fn_type_diff && fn_type_diff->to_be_reported()) {
+                    is_compatible = false;
+                    if (verbose_mode) {
+                        std::cerr << "Function expected by '" << expected_corpus->get_path()
+                                  << "' has a sub-type different from what '" 
+                                  << provided_corpus->get_path() << "' provides:\n";
+                        std::cerr << "  " << expected_fn->get_pretty_representation() << ":\n";
+                        fn_type_diff->report(std::cerr, "    ");
+                        std::cerr << "\n";
+                    }
+                }
+            }
+        }
     }
 
-    return !is_incompatible;
+    // 2. Compare Variables expected by the consumer against those provided by the supplier
+    for (const auto& expected_var : expected_corpus->get_sorted_undefined_variables()) {
+        abigail::interned_string var_id = expected_var->get_id();
+        const std::unordered_set<abigail::ir::var_decl_sptr>* exported_vars = 
+            provided_corpus->lookup_variables(var_id);
+        
+        if (exported_vars) {
+            for (auto exported_var : *exported_vars) {
+                abigail::comparison::diff_sptr type_diff =
+                    abigail::comparison::compute_diff(expected_var->get_type(),
+                                                      exported_var->get_type(),
+                                                      diff_ctxt);
+                
+                if (type_diff) {
+                    abigail::comparison::apply_filters_and_categorize_diff_node_tree(type_diff);
+                }
+                
+                if (type_diff && type_diff->to_be_reported()) {
+                    is_compatible = false;
+                    if (verbose_mode) {
+                        std::cerr << "Variable expected by '" << expected_corpus->get_path()
+                                  << "' has a sub-type different from what '" 
+                                  << provided_corpus->get_path() << "' provides:\n";
+                        std::cerr << "  " << expected_var->get_pretty_representation() << ":\n";
+                        type_diff->report(std::cerr, "    ");
+                        std::cerr << "\n";
+                    }
+                }
+            }
+        }
+    }
+
+    return is_compatible;
 }
 
 // Scans the .dynsym section of an ELF file for "dlopen" or "dlmopen"
@@ -111,7 +160,6 @@ int main(int argc, char** argv) {
     bool verbose_mode = false;
     int opt;
 
-    // Parse command line arguments
     while ((opt = getopt(argc, argv, "v")) != -1) {
         switch (opt) {
             case 'v':
@@ -123,7 +171,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Ensure a target program was provided after the options
     if (optind >= argc) {
         std::cerr << "Usage: " << argv[0] << " [-v] <target_program> [args...]\n";
         return 1;
@@ -180,7 +227,6 @@ int main(int argc, char** argv) {
     std::unordered_map<std::string, abigail::corpus_sptr> corpora;
     std::unordered_map<Lmid_t, std::vector<std::string>> loaded_lists;
     
-    // Track cookie -> {lmid, path} for la_objclose tracking
     std::unordered_map<uintptr_t, std::pair<Lmid_t, std::string>> cookie_map;
 
     bool uses_dlopen = false;
@@ -229,6 +275,9 @@ int main(int argc, char** argv) {
                         if (loaded_path == path) continue;
                         auto loaded = corpora[loaded_path];
                         
+                        // Because we are now doing expect-driven checks, the bi-directional 
+                        // check correctly asks: "Does the candidate break expectations of the loaded?"
+                        // AND "Does the loaded break expectations of the candidate?"
                         if (!is_abi_compatible(loaded, candidate, verbose_mode) || 
                             !is_abi_compatible(candidate, loaded, verbose_mode)) {
                             compatible = false;
